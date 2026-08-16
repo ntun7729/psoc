@@ -16,18 +16,32 @@ import (
 )
 
 const (
-	countryLookupURL = "https://api.country.is/"
-	speedTestURL     = "https://speed.cloudflare.com/__down"
-	speedSampleBytes = int64(1 << 20)
+	countryLookupURL    = "https://api.country.is/"
+	speedTestURL        = "https://speed.cloudflare.com/__down"
+	speedSampleBytes    = int64(1 << 20)
+	maxSpeedSampleBytes = int64(100 << 20)
 )
 
 type countryLookupResponse struct {
 	Country string `json:"country"`
 }
 
-// MeasureProxy enriches an already-verified proxy. Measurement failures do not
-// change the proxy's alive state; unavailable fields are simply left empty/zero.
+// MeasureProxy enriches an already-verified proxy using the default 1 MiB
+// Cloudflare sample. Measurement failures do not change the proxy's alive state.
 func (s *Scanner) MeasureProxy(parent context.Context, proxyAddr, protocol string) (string, float64) {
+	return s.MeasureProxyBytes(parent, proxyAddr, protocol, speedSampleBytes)
+}
+
+// MeasureProxyBytes enriches an already-verified proxy using an adjustable
+// Cloudflare download size. The caller controls concurrency separately.
+func (s *Scanner) MeasureProxyBytes(parent context.Context, proxyAddr, protocol string, sampleBytes int64) (string, float64) {
+	if sampleBytes <= 0 {
+		sampleBytes = speedSampleBytes
+	}
+	if sampleBytes > maxSpeedSampleBytes {
+		sampleBytes = maxSpeedSampleBytes
+	}
+
 	country := ""
 	geoCtx, geoCancel := context.WithTimeout(parent, s.measurementTimeout())
 	if status, body, _, err := s.fetchViaProxy(geoCtx, proxyAddr, protocol, countryLookupURL, 8<<10, ""); err == nil && status >= 200 && status < 300 {
@@ -42,15 +56,24 @@ func (s *Scanner) MeasureProxy(parent context.Context, proxyAddr, protocol strin
 	geoCancel()
 
 	// Cloudflare's speed-test endpoint generates exactly the requested payload.
-	// Use a 1 MiB sample to reduce noise without adding excessive bandwidth.
-	downloadURL := fmt.Sprintf("%s?bytes=%d", speedTestURL, speedSampleBytes)
-	speedCtx, speedCancel := context.WithTimeout(parent, s.measurementTimeout())
-	status, body, elapsed, err := s.fetchViaProxy(speedCtx, proxyAddr, protocol, downloadURL, speedSampleBytes, "")
+	downloadURL := fmt.Sprintf("%s?bytes=%d", speedTestURL, sampleBytes)
+	speedCtx, speedCancel := context.WithTimeout(parent, s.speedMeasurementTimeout(sampleBytes))
+	status, body, elapsed, err := s.fetchViaProxy(speedCtx, proxyAddr, protocol, downloadURL, sampleBytes, "")
 	speedCancel()
 	if err != nil || status != http.StatusOK {
 		return country, 0
 	}
 	return country, mbpsFor(int64(len(body)), elapsed)
+}
+
+func speedSampleBytesForMB(downloadMB int) int64 {
+	if downloadMB <= 0 {
+		downloadMB = 1
+	}
+	if downloadMB > 100 {
+		downloadMB = 100
+	}
+	return int64(downloadMB) << 20
 }
 
 func (s *Scanner) measurementTimeout() time.Duration {
@@ -60,6 +83,18 @@ func (s *Scanner) measurementTimeout() time.Duration {
 	}
 	if d > 12*time.Second {
 		d = 12 * time.Second
+	}
+	return d
+}
+
+func (s *Scanner) speedMeasurementTimeout(sampleBytes int64) time.Duration {
+	d := s.measurementTimeout()
+	mib := (sampleBytes + (1 << 20) - 1) / (1 << 20)
+	if mib > 1 {
+		d += time.Duration(mib-1) * 2 * time.Second
+	}
+	if d > 90*time.Second {
+		d = 90 * time.Second
 	}
 	return d
 }
