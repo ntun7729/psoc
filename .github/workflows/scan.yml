@@ -45,15 +45,17 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: false
-      - name: Build
-        run: go build -trimpath -o psoc .
+      - name: Build static scanner binary
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/psoc .
       - name: Check public proxy feeds and proxies
         if: ${{ inputs.mode == 'public-sources' }}
         env:
           VERIFY_URL: ${{ inputs.verify_url }}
         run: |
           set -euo pipefail
-          ./psoc serve \
+          ./bin/psoc serve \
             --listen 127.0.0.1:8080 \
             --data ./results.json \
             --verify-url "$VERIFY_URL" \
@@ -99,7 +101,7 @@ jobs:
             exit 2
           fi
           printf '%s\n' "$TARGETS" > targets.txt
-          ./psoc scan \
+          ./bin/psoc scan \
             --input targets.txt \
             --output results.json \
             --format json \
