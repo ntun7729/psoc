@@ -11,14 +11,15 @@ import (
 )
 
 type ProxyResult struct {
-	Target    string    `json:"target"`
-	Protocol  string    `json:"protocol"`
-	Alive     bool      `json:"alive"`
-	LatencyMS int64     `json:"latency_ms"`
-	Status    int       `json:"status,omitempty"`
-	CheckedAt time.Time `json:"checked_at"`
-	Country   string    `json:"country,omitempty"`
-	DownMbps  float64   `json:"down_mbps,omitempty"`
+	Target      string    `json:"target"`
+	Protocol    string    `json:"protocol"`
+	Alive       bool      `json:"alive"`
+	LatencyMS   int64     `json:"latency_ms"`
+	Status      int       `json:"status,omitempty"`
+	CheckedAt   time.Time `json:"checked_at"`
+	Country     string    `json:"country,omitempty"`
+	NetworkType string    `json:"network_type,omitempty"`
+	DownMbps    float64   `json:"down_mbps,omitempty"`
 }
 
 func ProxyResultFrom(r Result) ProxyResult {
