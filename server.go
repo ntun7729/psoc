@@ -17,7 +17,10 @@ import (
 //go:embed dashboard.html results.html
 var dashboardFS embed.FS
 
-const proxyMeasurementConcurrency = 5
+const (
+	proxyMeasurementConcurrency = 5
+	maxDownloadMB               = 100
+)
 
 type App struct {
 	cfg      Config
@@ -26,10 +29,18 @@ type App struct {
 
 	scanMu        sync.Mutex
 	scanning      bool
+	scanCancel    context.CancelFunc
 	started       time.Time
 	lastErr       string
 	scanCompleted int
 	scanTotal     int
+
+	measuring       bool
+	measureStarted  time.Time
+	measureLastErr  string
+	measureCompleted int
+	measureTotal     int
+	measureDownloadMB int
 
 	sourceMu       sync.RWMutex
 	sourceStatuses []SourceStatus
@@ -54,6 +65,8 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/status", a.handleStatus)
 	mux.HandleFunc("GET /api/sources", a.handleSources)
 	mux.HandleFunc("POST /api/scan", a.withAuth(a.handleScan))
+	mux.HandleFunc("POST /api/scan/stop", a.withAuth(a.handleStopScan))
+	mux.HandleFunc("POST /api/measure", a.withAuth(a.handleMeasure))
 	mux.HandleFunc("POST /api/sources/refresh", a.withAuth(a.handleSourceRefresh))
 	return securityHeaders(mux)
 }
@@ -95,17 +108,30 @@ func (a *App) handleProxies(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
-	percent := 0
+
+	scanPercent := 0
 	if a.scanTotal > 0 {
-		percent = a.scanCompleted * 100 / a.scanTotal
+		scanPercent = a.scanCompleted * 100 / a.scanTotal
 	}
+	measurePercent := 0
+	if a.measureTotal > 0 {
+		measurePercent = a.measureCompleted * 100 / a.measureTotal
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scanning":   a.scanning,
-		"started":    a.started,
-		"last_error": a.lastErr,
-		"completed":  a.scanCompleted,
-		"total":      a.scanTotal,
-		"percent":    percent,
+		"scanning":           a.scanning,
+		"started":            a.started,
+		"last_error":         a.lastErr,
+		"completed":          a.scanCompleted,
+		"total":              a.scanTotal,
+		"percent":            scanPercent,
+		"measuring":          a.measuring,
+		"measure_started":    a.measureStarted,
+		"last_measure_error": a.measureLastErr,
+		"measure_completed":  a.measureCompleted,
+		"measure_total":      a.measureTotal,
+		"measure_percent":    measurePercent,
+		"download_mb":        a.measureDownloadMB,
 	})
 }
 
@@ -152,11 +178,6 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !a.beginScan(scanJobCount(targets, cfg)) {
-		http.Error(w, "scan already running", http.StatusConflict)
-		return
-	}
-
 	maxRuntime := time.Duration(len(targets)+1) * cfg.Timeout
 	if maxRuntime < 30*time.Second {
 		maxRuntime = 30 * time.Second
@@ -164,8 +185,14 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 	if maxRuntime > 30*time.Minute {
 		maxRuntime = 30 * time.Minute
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), maxRuntime)
+	if !a.beginScan(scanJobCount(targets, cfg), cancel) {
+		cancel()
+		http.Error(w, "proxy checking or downspeed measurement already running", http.StatusConflict)
+		return
+	}
+
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), maxRuntime)
 		defer cancel()
 		_, err := a.startScanWithConfig(ctx, targets, cfg)
 		a.finishScan(err)
@@ -178,23 +205,90 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
-	if !a.beginScan(0) {
-		http.Error(w, "scan already running", http.StatusConflict)
+func (a *App) handleStopScan(w http.ResponseWriter, r *http.Request) {
+	if !a.stopScan() {
+		http.Error(w, "no proxy check is running", http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "stopping": true})
+}
+
+type measureRequest struct {
+	DownloadMB int `json:"download_mb"`
+}
+
+func (a *App) handleMeasure(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	defer r.Body.Close()
+	var req measureRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.DownloadMB == 0 {
+		req.DownloadMB = 1
+	}
+	if req.DownloadMB < 1 || req.DownloadMB > maxDownloadMB {
+		http.Error(w, fmt.Sprintf("download_mb must be between 1 and %d", maxDownloadMB), http.StatusBadRequest)
+		return
+	}
+
+	proxies := a.store.All()
+	if len(proxies) == 0 {
+		http.Error(w, "no alive proxies to measure", http.StatusBadRequest)
+		return
+	}
+	scanner, err := NewScanner(a.cfg)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+	if !a.beginMeasure(len(proxies), req.DownloadMB) {
+		cancel()
+		http.Error(w, "proxy checking or downspeed measurement already running", http.StatusConflict)
 		return
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
+		err := a.enrichAliveProxies(ctx, scanner, proxies, speedSampleBytesForMB(req.DownloadMB))
+		if persistErr := a.store.Save(); persistErr != nil && err == nil {
+			err = persistErr
+		}
+		a.finishMeasure(err)
+	}()
 
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"accepted":    true,
+		"proxies":     len(proxies),
+		"download_mb": req.DownloadMB,
+		"concurrency": proxyMeasurementConcurrency,
+	})
+}
+
+func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	if !a.beginScan(0, cancel) {
+		cancel()
+		http.Error(w, "proxy checking or downspeed measurement already running", http.StatusConflict)
+		return
+	}
+
+	go func() {
+		defer cancel()
 		targets, statuses := FetchPublicProxySources(ctx, a.cfg.MaxTargets)
 		a.sourceMu.Lock()
 		a.sourceStatuses = statuses
 		a.sourceMu.Unlock()
 
 		var err error
-		if len(targets) == 0 {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		} else if len(targets) == 0 {
 			err = errors.New("public sources returned no valid targets")
 		} else {
 			a.setScanTotal(scanJobCount(targets, a.cfg))
@@ -210,17 +304,28 @@ func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) beginScan(total int) bool {
+func (a *App) beginScan(total int, cancel context.CancelFunc) bool {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
-	if a.scanning {
+	if a.scanning || a.measuring {
 		return false
 	}
 	a.scanning = true
+	a.scanCancel = cancel
 	a.started = time.Now().UTC()
 	a.lastErr = ""
 	a.scanCompleted = 0
 	a.scanTotal = total
+	return true
+}
+
+func (a *App) stopScan() bool {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if !a.scanning || a.scanCancel == nil {
+		return false
+	}
+	a.scanCancel()
 	return true
 }
 
@@ -240,15 +345,54 @@ func (a *App) finishScan(err error) {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
 	a.scanning = false
+	a.scanCancel = nil
 	if err != nil && !errors.Is(err, context.Canceled) {
 		a.lastErr = err.Error()
 		log.Printf("scan: %v", err)
 	}
 }
 
+func (a *App) beginMeasure(total, downloadMB int) bool {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if a.scanning || a.measuring {
+		return false
+	}
+	a.measuring = true
+	a.measureStarted = time.Now().UTC()
+	a.measureLastErr = ""
+	a.measureCompleted = 0
+	a.measureTotal = total
+	a.measureDownloadMB = downloadMB
+	return true
+}
+
+func (a *App) incrementMeasureProgress() {
+	a.scanMu.Lock()
+	a.measureCompleted++
+	a.scanMu.Unlock()
+}
+
+func (a *App) finishMeasure(err error) {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	a.measuring = false
+	if err != nil && !errors.Is(err, context.Canceled) {
+		a.measureLastErr = err.Error()
+		log.Printf("measure: %v", err)
+	}
+}
+
 func (a *App) StartScan(ctx context.Context, targets []Target) ([]Result, error) {
-	a.setScanTotal(scanJobCount(targets, a.cfg))
-	return a.startScanWithConfig(ctx, targets, a.cfg)
+	ctx, cancel := context.WithCancel(ctx)
+	if !a.beginScan(scanJobCount(targets, a.cfg), cancel) {
+		cancel()
+		return nil, errors.New("proxy checking or downspeed measurement already running")
+	}
+	defer cancel()
+	results, err := a.startScanWithConfig(ctx, targets, a.cfg)
+	a.finishScan(err)
+	return results, err
 }
 
 func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Config) ([]Result, error) {
@@ -257,9 +401,8 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 		return nil, err
 	}
 
-	// Verification runs by itself. Alive proxies are visible immediately, but
-	// bandwidth measurements wait until all proxy checks have finished so the
-	// two workloads do not compete for CPU or network scheduling.
+	// Verification runs by itself. Alive proxies are stored immediately. Country
+	// and downspeed measurement is a separate, explicitly started operation.
 	a.store.Reset()
 	results, err := scanner.ScanWithProgress(ctx, targets, func(r Result) {
 		if r.Alive {
@@ -268,19 +411,15 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 		a.incrementScanProgress()
 	})
 
-	if err == nil && ctx.Err() == nil {
-		a.enrichAliveProxies(ctx, scanner)
-	}
 	if persistErr := a.store.Save(); persistErr != nil && err == nil {
 		err = persistErr
 	}
 	return results, err
 }
 
-func (a *App) enrichAliveProxies(ctx context.Context, scanner *Scanner) {
-	proxies := a.store.All()
+func (a *App) enrichAliveProxies(ctx context.Context, scanner *Scanner, proxies []ProxyResult, sampleBytes int64) error {
 	if len(proxies) == 0 {
-		return
+		return nil
 	}
 
 	workers := proxyMeasurementConcurrency
@@ -294,14 +433,13 @@ func (a *App) enrichAliveProxies(ctx context.Context, scanner *Scanner) {
 		go func() {
 			defer wg.Done()
 			for pr := range jobs {
-				country, downMbps := scanner.MeasureProxy(ctx, pr.Target, pr.Protocol)
+				country, downMbps := scanner.MeasureProxyBytes(ctx, pr.Target, pr.Protocol, sampleBytes)
 				if country != "" {
 					pr.Country = country
 				}
-				if downMbps > 0 {
-					pr.DownMbps = downMbps
-				}
+				pr.DownMbps = downMbps
 				a.store.UpsertProxy(pr)
+				a.incrementMeasureProgress()
 			}
 		}()
 	}
@@ -316,6 +454,10 @@ sendLoop:
 	}
 	close(jobs)
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
