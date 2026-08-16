@@ -1,0 +1,18 @@
+services:
+  psoc:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PSOC_LISTEN: ":8080"
+      PSOC_CONCURRENCY: "64"
+      PSOC_TIMEOUT: "8s"
+      PSOC_VERIFY_URL: "https://example.com/"
+      # Recommended if you expose the dashboard beyond localhost:
+      # PSOC_API_TOKEN: "change-me"
+    volumes:
+      - psoc-data:/data
+
+volumes:
+  psoc-data:
