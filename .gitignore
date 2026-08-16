@@ -1,0 +1,6 @@
+/bin/
+/data/
+results.json
+targets.txt
+*.log
+.DS_Store
