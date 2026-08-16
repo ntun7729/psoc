@@ -26,10 +26,18 @@ type App struct {
 	scanning bool
 	started  time.Time
 	lastErr  string
+
+	sourceMu       sync.RWMutex
+	sourceStatuses []SourceStatus
 }
 
 func NewApp(cfg Config, store *Store, apiToken string) *App {
-	return &App{cfg: cfg, store: store, apiToken: apiToken}
+	return &App{
+		cfg:            cfg,
+		store:          store,
+		apiToken:       apiToken,
+		sourceStatuses: InitialSourceStatuses(),
+	}
 }
 
 func (a *App) Routes() http.Handler {
@@ -39,7 +47,9 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/stats", a.handleStats)
 	mux.HandleFunc("GET /api/proxies", a.handleProxies)
 	mux.HandleFunc("GET /api/status", a.handleStatus)
+	mux.HandleFunc("GET /api/sources", a.handleSources)
 	mux.HandleFunc("POST /api/scan", a.withAuth(a.handleScan))
+	mux.HandleFunc("POST /api/sources/refresh", a.withAuth(a.handleSourceRefresh))
 	return securityHeaders(mux)
 }
 
@@ -79,6 +89,13 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) handleSources(w http.ResponseWriter, r *http.Request) {
+	a.sourceMu.RLock()
+	statuses := append([]SourceStatus(nil), a.sourceStatuses...)
+	a.sourceMu.RUnlock()
+	writeJSON(w, http.StatusOK, statuses)
+}
+
 type scanRequest struct {
 	Targets   string   `json:"targets"`
 	Protocols []string `json:"protocols,omitempty"`
@@ -115,16 +132,10 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	a.scanMu.Lock()
-	if a.scanning {
-		a.scanMu.Unlock()
+	if !a.beginScan() {
 		http.Error(w, "scan already running", http.StatusConflict)
 		return
 	}
-	a.scanning = true
-	a.started = time.Now().UTC()
-	a.lastErr = ""
-	a.scanMu.Unlock()
 
 	// Detach from the request while retaining a bounded total runtime.
 	maxRuntime := time.Duration(len(targets)+1) * cfg.Timeout
@@ -138,16 +149,63 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), maxRuntime)
 		defer cancel()
 		_, err := a.startScanWithConfig(ctx, targets, cfg)
-		a.scanMu.Lock()
-		a.scanning = false
-		if err != nil && !errors.Is(err, context.Canceled) {
-			a.lastErr = err.Error()
-			log.Printf("scan: %v", err)
-		}
-		a.scanMu.Unlock()
+		a.finishScan(err)
 	}()
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "targets": len(targets)})
+}
+
+func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
+	if !a.beginScan() {
+		http.Error(w, "scan already running", http.StatusConflict)
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		targets, statuses := FetchPublicProxySources(ctx, a.cfg.MaxTargets)
+		a.sourceMu.Lock()
+		a.sourceStatuses = statuses
+		a.sourceMu.Unlock()
+
+		var err error
+		if len(targets) == 0 {
+			err = errors.New("public sources returned no valid targets")
+		} else {
+			_, err = a.startScanWithConfig(ctx, targets, a.cfg)
+		}
+		a.finishScan(err)
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"accepted": true,
+		"sources":  len(DefaultPublicSources()),
+		"limit":    a.cfg.MaxTargets,
+	})
+}
+
+func (a *App) beginScan() bool {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if a.scanning {
+		return false
+	}
+	a.scanning = true
+	a.started = time.Now().UTC()
+	a.lastErr = ""
+	return true
+}
+
+func (a *App) finishScan(err error) {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	a.scanning = false
+	if err != nil && !errors.Is(err, context.Canceled) {
+		a.lastErr = err.Error()
+		log.Printf("scan: %v", err)
+	}
 }
 
 func (a *App) StartScan(ctx context.Context, targets []Target) ([]Result, error) {
