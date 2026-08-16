@@ -17,6 +17,7 @@ import (
 
 const (
 	countryLookupURL    = "https://api.country.is/"
+	networkLookupURL    = "http://ip-api.com/json/?fields=status,proxy,hosting"
 	speedTestURL        = "https://speed.cloudflare.com/__down"
 	speedSampleBytes    = int64(1 << 20)
 	maxSpeedSampleBytes = int64(100 << 20)
@@ -26,15 +27,30 @@ type countryLookupResponse struct {
 	Country string `json:"country"`
 }
 
+type networkLookupResponse struct {
+	Status  string `json:"status"`
+	Proxy   bool   `json:"proxy"`
+	Hosting bool   `json:"hosting"`
+}
+
 // MeasureProxy enriches an already-verified proxy using the default 1 MiB
 // Cloudflare sample. Measurement failures do not change the proxy's alive state.
 func (s *Scanner) MeasureProxy(parent context.Context, proxyAddr, protocol string) (string, float64) {
-	return s.MeasureProxyBytes(parent, proxyAddr, protocol, speedSampleBytes)
+	country, _, downMbps := s.MeasureProxyProfileBytes(parent, proxyAddr, protocol, speedSampleBytes)
+	return country, downMbps
 }
 
-// MeasureProxyBytes enriches an already-verified proxy using an adjustable
-// Cloudflare download size. The caller controls concurrency separately.
+// MeasureProxyBytes preserves the original country/downspeed API while the
+// profile variant also returns the network classification.
 func (s *Scanner) MeasureProxyBytes(parent context.Context, proxyAddr, protocol string, sampleBytes int64) (string, float64) {
+	country, _, downMbps := s.MeasureProxyProfileBytes(parent, proxyAddr, protocol, sampleBytes)
+	return country, downMbps
+}
+
+// MeasureProxyProfileBytes enriches an already-verified proxy with country,
+// network type and adjustable Cloudflare download speed. The caller controls
+// concurrency separately.
+func (s *Scanner) MeasureProxyProfileBytes(parent context.Context, proxyAddr, protocol string, sampleBytes int64) (string, string, float64) {
 	if sampleBytes <= 0 {
 		sampleBytes = speedSampleBytes
 	}
@@ -55,15 +71,38 @@ func (s *Scanner) MeasureProxyBytes(parent context.Context, proxyAddr, protocol 
 	}
 	geoCancel()
 
+	networkType := ""
+	networkCtx, networkCancel := context.WithTimeout(parent, s.measurementTimeout())
+	if status, body, _, err := s.fetchViaProxy(networkCtx, proxyAddr, protocol, networkLookupURL, 8<<10, ""); err == nil && status >= 200 && status < 300 {
+		var info networkLookupResponse
+		if json.Unmarshal(body, &info) == nil {
+			networkType = classifyNetworkType(info)
+		}
+	}
+	networkCancel()
+
 	// Cloudflare's speed-test endpoint generates exactly the requested payload.
 	downloadURL := fmt.Sprintf("%s?bytes=%d", speedTestURL, sampleBytes)
 	speedCtx, speedCancel := context.WithTimeout(parent, s.speedMeasurementTimeout(sampleBytes))
 	status, body, elapsed, err := s.fetchViaProxy(speedCtx, proxyAddr, protocol, downloadURL, sampleBytes, "")
 	speedCancel()
 	if err != nil || status != http.StatusOK {
-		return country, 0
+		return country, networkType, 0
 	}
-	return country, mbpsFor(int64(len(body)), elapsed)
+	return country, networkType, mbpsFor(int64(len(body)), elapsed)
+}
+
+func classifyNetworkType(info networkLookupResponse) string {
+	if !strings.EqualFold(strings.TrimSpace(info.Status), "success") {
+		return ""
+	}
+	if info.Hosting {
+		return "Proxy/Hosting"
+	}
+	if info.Proxy {
+		return "Residential Proxy"
+	}
+	return "Residential"
 }
 
 func speedSampleBytesForMB(downloadMB int) int64 {
