@@ -17,8 +17,8 @@ import (
 
 const (
 	countryLookupURL = "https://api.country.is/"
-	speedTestURL     = "https://fsn1-speed.hetzner.com/100MB.bin"
-	speedSampleBytes = int64(128 << 10)
+	speedTestURL     = "https://speed.cloudflare.com/__down"
+	speedSampleBytes = int64(1 << 20)
 )
 
 type countryLookupResponse struct {
@@ -41,10 +41,13 @@ func (s *Scanner) MeasureProxy(parent context.Context, proxyAddr, protocol strin
 	}
 	geoCancel()
 
+	// Cloudflare's speed-test endpoint generates exactly the requested payload.
+	// Use a 1 MiB sample to reduce noise without adding excessive bandwidth.
+	downloadURL := fmt.Sprintf("%s?bytes=%d", speedTestURL, speedSampleBytes)
 	speedCtx, speedCancel := context.WithTimeout(parent, s.measurementTimeout())
-	status, body, elapsed, err := s.fetchViaProxy(speedCtx, proxyAddr, protocol, speedTestURL, speedSampleBytes, fmt.Sprintf("bytes=0-%d", speedSampleBytes-1))
+	status, body, elapsed, err := s.fetchViaProxy(speedCtx, proxyAddr, protocol, downloadURL, speedSampleBytes, "")
 	speedCancel()
-	if err != nil || (status != http.StatusOK && status != http.StatusPartialContent) {
+	if err != nil || status != http.StatusOK {
 		return country, 0
 	}
 	return country, mbpsFor(int64(len(body)), elapsed)
