@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-//go:embed dashboard.html
+//go:embed dashboard.html results.html
 var dashboardFS embed.FS
 
 type App struct {
@@ -45,6 +45,7 @@ func NewApp(cfg Config, store *Store, apiToken string) *App {
 func (a *App) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", a.handleDashboard)
+	mux.HandleFunc("GET /results", a.handleResults)
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /api/stats", a.handleStats)
 	mux.HandleFunc("GET /api/proxies", a.handleProxies)
@@ -60,7 +61,15 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	b, err := dashboardFS.ReadFile("dashboard.html")
+	a.serveEmbeddedHTML(w, "dashboard.html")
+}
+
+func (a *App) handleResults(w http.ResponseWriter, r *http.Request) {
+	a.serveEmbeddedHTML(w, "results.html")
+}
+
+func (a *App) serveEmbeddedHTML(w http.ResponseWriter, name string) {
+	b, err := dashboardFS.ReadFile(name)
 	if err != nil {
 		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
 		return
@@ -146,7 +155,6 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detach from the request while retaining a bounded total runtime.
 	maxRuntime := time.Duration(len(targets)+1) * cfg.Timeout
 	if maxRuntime < 30*time.Second {
 		maxRuntime = 30 * time.Second
@@ -247,13 +255,47 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 		return nil, err
 	}
 
-	// Start the dashboard with a clean result set, then populate it as checks
-	// finish. This avoids a long empty-results period on large public lists.
+	// Each scan starts with a clean alive-only result set. Verified proxies are
+	// visible immediately, then country and speed are filled in asynchronously.
 	a.store.Reset()
+	measureWorkers := cfg.Concurrency / 4
+	if measureWorkers < 4 {
+		measureWorkers = 4
+	}
+	if measureWorkers > 24 {
+		measureWorkers = 24
+	}
+	measureSem := make(chan struct{}, measureWorkers)
+	var measureWG sync.WaitGroup
+
 	results, err := scanner.ScanWithProgress(ctx, targets, func(r Result) {
-		a.store.Upsert(r)
+		if r.Alive {
+			base := ProxyResultFrom(r)
+			a.store.UpsertProxy(base)
+			measureWG.Add(1)
+			go func(pr ProxyResult) {
+				defer measureWG.Done()
+				select {
+				case measureSem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				defer func() { <-measureSem }()
+
+				country, downMbps := scanner.MeasureProxy(ctx, pr.Target, pr.Protocol)
+				if country != "" {
+					pr.Country = country
+				}
+				if downMbps > 0 {
+					pr.DownMbps = downMbps
+				}
+				a.store.UpsertProxy(pr)
+			}(base)
+		}
 		a.incrementScanProgress()
 	})
+
+	measureWG.Wait()
 	if persistErr := a.store.Save(); persistErr != nil && err == nil {
 		err = persistErr
 	}
