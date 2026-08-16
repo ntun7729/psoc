@@ -423,8 +423,8 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 		return nil, err
 	}
 
-	// Verification runs by itself. Alive proxies are stored immediately. Country
-	// and downspeed measurement is a separate, explicitly started operation.
+	// Verification runs by itself. Alive proxies are stored immediately. Country,
+	// network type and downspeed measurement are a separate explicit operation.
 	a.store.Reset()
 	results, err := scanner.ScanWithProgress(ctx, targets, func(r Result) {
 		if r.Alive {
@@ -455,9 +455,12 @@ func (a *App) enrichAliveProxies(ctx context.Context, scanner *Scanner, proxies 
 		go func() {
 			defer wg.Done()
 			for pr := range jobs {
-				country, downMbps := scanner.MeasureProxyBytes(ctx, pr.Target, pr.Protocol, sampleBytes)
+				country, networkType, downMbps := scanner.MeasureProxyProfileBytes(ctx, pr.Target, pr.Protocol, sampleBytes)
 				if country != "" {
 					pr.Country = country
+				}
+				if networkType != "" {
+					pr.NetworkType = networkType
 				}
 				pr.DownMbps = downMbps
 				a.store.UpsertProxy(pr)
