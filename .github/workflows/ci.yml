@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,5 +19,33 @@ jobs:
           cache: false
       - run: go test ./...
       - run: go vet ./...
-      - run: go build -trimpath -o psoc .
+      - name: Build Linux amd64 binary for Docker
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/psoc .
+      - run: ./bin/psoc version
       - run: docker build -t psoc:test .
+
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Build static Linux binary
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags='-s -w' -o "dist/psoc-linux-$GOARCH" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: psoc-linux-${{ matrix.goarch }}
+          path: dist/psoc-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 14
