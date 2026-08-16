@@ -3,12 +3,20 @@ name: Manual proxy check
 on:
   workflow_dispatch:
     inputs:
-      targets:
-        description: "Explicit host:port or protocol://host:port targets (whitespace/newline separated)"
+      mode:
+        description: "Where targets come from"
         required: true
+        default: "public-sources"
+        type: choice
+        options:
+          - "public-sources"
+          - "manual-targets"
+      targets:
+        description: "Manual host:port or protocol://host:port targets (used in manual-targets mode)"
+        required: false
         type: string
       protocols:
-        description: "Protocols for bare host:port targets"
+        description: "Protocols for bare manual host:port targets"
         required: true
         default: "http,socks5,socks4"
         type: choice
@@ -30,31 +38,82 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
           cache: false
-      - name: Write explicit targets
+      - name: Build
+        run: go build -trimpath -o psoc .
+      - name: Check public proxy feeds and proxies
+        if: ${{ inputs.mode == 'public-sources' }}
+        env:
+          VERIFY_URL: ${{ inputs.verify_url }}
+        run: |
+          set -euo pipefail
+          ./psoc serve \
+            --listen 127.0.0.1:8080 \
+            --data ./results.json \
+            --verify-url "$VERIFY_URL" \
+            --concurrency 64 \
+            --timeout 8s \
+            --max-targets 5000 >server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz >/dev/null
+          curl -fsS -X POST http://127.0.0.1:8080/api/sources/refresh >/dev/null
+
+          for _ in $(seq 1 900); do
+            status="$(curl -fsS http://127.0.0.1:8080/api/status)"
+            if [[ "$(jq -r '.scanning' <<<"$status")" == "false" ]]; then
+              error="$(jq -r '.last_error // empty' <<<"$status")"
+              if [[ -n "$error" ]]; then
+                echo "scan failed: $error" >&2
+                exit 1
+              fi
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:8080/api/sources > sources.json
+          test -s results.json
+      - name: Check manual targets
+        if: ${{ inputs.mode == 'manual-targets' }}
         env:
           TARGETS: ${{ inputs.targets }}
-        run: printf '%s\n' "$TARGETS" > targets.txt
-      - name: Check proxies
-        run: >-
-          go run . scan
-          --input targets.txt
-          --output results.json
-          --format json
-          --protocols '${{ inputs.protocols }}'
-          --verify-url '${{ inputs.verify_url }}'
-          --concurrency 32
-          --timeout 8s
-          --max-targets 500
+          VERIFY_URL: ${{ inputs.verify_url }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGETS//[[:space:]]/}" ]]; then
+            echo "targets is required in manual-targets mode" >&2
+            exit 2
+          fi
+          printf '%s\n' "$TARGETS" > targets.txt
+          ./psoc scan \
+            --input targets.txt \
+            --output results.json \
+            --format json \
+            --protocols '${{ inputs.protocols }}' \
+            --verify-url "$VERIFY_URL" \
+            --concurrency 32 \
+            --timeout 8s \
+            --max-targets 500
       - uses: actions/upload-artifact@v4
         with:
           name: psoc-results
-          path: results.json
+          path: |
+            results.json
+            sources.json
+            server.log
           if-no-files-found: error
           retention-days: 7
