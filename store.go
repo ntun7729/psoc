@@ -10,14 +10,36 @@ import (
 	"time"
 )
 
+type ProxyResult struct {
+	Target    string    `json:"target"`
+	Protocol  string    `json:"protocol"`
+	Alive     bool      `json:"alive"`
+	LatencyMS int64     `json:"latency_ms"`
+	Status    int       `json:"status,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	Country   string    `json:"country,omitempty"`
+	DownMbps  float64   `json:"down_mbps,omitempty"`
+}
+
+func ProxyResultFrom(r Result) ProxyResult {
+	return ProxyResult{
+		Target:    r.Target,
+		Protocol:  r.Protocol,
+		Alive:     r.Alive,
+		LatencyMS: r.LatencyMS,
+		Status:    r.Status,
+		CheckedAt: r.CheckedAt,
+	}
+}
+
 type Store struct {
 	mu      sync.RWMutex
 	path    string
-	results map[string]Result
+	results map[string]ProxyResult
 }
 
 func NewStore(path string) *Store {
-	return &Store{path: path, results: make(map[string]Result)}
+	return &Store{path: path, results: make(map[string]ProxyResult)}
 }
 
 func (s *Store) Load() error {
@@ -27,43 +49,59 @@ func (s *Store) Load() error {
 	if err != nil {
 		return err
 	}
-	var rs []Result
+	var rs []ProxyResult
 	if err := json.Unmarshal(b, &rs); err != nil {
 		return err
 	}
+	s.results = make(map[string]ProxyResult)
 	for _, r := range rs {
-		s.results[keyFor(r)] = r
+		if !r.Alive {
+			continue
+		}
+		s.results[keyForProxy(r)] = r
 	}
 	return nil
 }
 
-func (s *Store) Replace(rs []Result) error {
+func (s *Store) Replace(rs []ProxyResult) error {
 	s.mu.Lock()
+	s.results = make(map[string]ProxyResult)
 	for _, r := range rs {
-		s.results[keyFor(r)] = r
+		if r.Alive {
+			s.results[keyForProxy(r)] = r
+		}
 	}
 	snapshot := s.snapshotLocked()
 	s.mu.Unlock()
 	return s.persist(snapshot)
 }
 
-func (s *Store) All() []Result {
+func (s *Store) All() []ProxyResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.snapshotLocked()
 }
 
-func (s *Store) snapshotLocked() []Result {
-	out := make([]Result, 0, len(s.results))
+func (s *Store) snapshotLocked() []ProxyResult {
+	out := make([]ProxyResult, 0, len(s.results))
 	for _, r := range s.results {
-		out = append(out, r)
+		if r.Alive {
+			out = append(out, r)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Alive != out[j].Alive {
-			return out[i].Alive
+		li, lj := out[i].LatencyMS, out[j].LatencyMS
+		if li <= 0 {
+			li = 1<<62 - 1
 		}
-		if !out[i].CheckedAt.Equal(out[j].CheckedAt) {
-			return out[i].CheckedAt.After(out[j].CheckedAt)
+		if lj <= 0 {
+			lj = 1<<62 - 1
+		}
+		if li != lj {
+			return li < lj
+		}
+		if out[i].DownMbps != out[j].DownMbps {
+			return out[i].DownMbps > out[j].DownMbps
 		}
 		if out[i].Target != out[j].Target {
 			return out[i].Target < out[j].Target
@@ -73,7 +111,7 @@ func (s *Store) snapshotLocked() []Result {
 	return out
 }
 
-func (s *Store) persist(rs []Result) error {
+func (s *Store) persist(rs []ProxyResult) error {
 	if s.path == "" {
 		return nil
 	}
@@ -92,43 +130,40 @@ func (s *Store) persist(rs []Result) error {
 }
 
 func keyFor(r Result) string { return r.Protocol + "|" + r.Target }
+func keyForProxy(r ProxyResult) string { return r.Protocol + "|" + r.Target }
 
 type Stats struct {
-	Total       int       `json:"total"`
-	Alive       int       `json:"alive"`
-	Dead        int       `json:"dead"`
-	HTTP        int       `json:"http"`
-	SOCKS5      int       `json:"socks5"`
-	SOCKS4      int       `json:"socks4"`
-	AvgLatency  int64     `json:"avg_latency_ms"`
-	LastChecked time.Time `json:"last_checked,omitempty"`
+	Total         int       `json:"total"`
+	Alive         int       `json:"alive"`
+	HTTP          int       `json:"http"`
+	SOCKS5        int       `json:"socks5"`
+	SOCKS4        int       `json:"socks4"`
+	LowestLatency int64     `json:"lowest_latency_ms"`
+	LastChecked   time.Time `json:"last_checked,omitempty"`
 }
 
-func BuildStats(rs []Result) Stats {
+func BuildStats(rs []ProxyResult) Stats {
 	var st Stats
-	var latencySum int64
 	for _, r := range rs {
+		if !r.Alive {
+			continue
+		}
 		st.Total++
-		if r.Alive {
-			st.Alive++
-			latencySum += r.LatencyMS
-			switch r.Protocol {
-			case "http":
-				st.HTTP++
-			case "socks5":
-				st.SOCKS5++
-			case "socks4":
-				st.SOCKS4++
-			}
-		} else {
-			st.Dead++
+		st.Alive++
+		if r.LatencyMS > 0 && (st.LowestLatency == 0 || r.LatencyMS < st.LowestLatency) {
+			st.LowestLatency = r.LatencyMS
+		}
+		switch r.Protocol {
+		case "http":
+			st.HTTP++
+		case "socks5":
+			st.SOCKS5++
+		case "socks4":
+			st.SOCKS4++
 		}
 		if r.CheckedAt.After(st.LastChecked) {
 			st.LastChecked = r.CheckedAt
 		}
-	}
-	if st.Alive > 0 {
-		st.AvgLatency = latencySum / int64(st.Alive)
 	}
 	return st
 }
