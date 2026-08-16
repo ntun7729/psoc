@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>psoc proxy checker</title>
+<style>
+:root{color-scheme:dark;--bg:#090d12;--panel:#101720;--panel2:#151e29;--line:#263345;--text:#e7eef7;--muted:#8fa0b5;--ok:#44d17a;--bad:#ff6b6b;--accent:#65a7ff;--warn:#f7c948}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#0d131b,#090d12 240px);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 56px}header{display:flex;align-items:end;justify-content:space-between;gap:18px;margin-bottom:20px}h1{margin:0;font-size:30px;letter-spacing:-.03em}header p{margin:5px 0 0;color:var(--muted)}.badge{padding:7px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);background:#0c1219}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}.card,.panel{background:rgba(16,23,32,.92);border:1px solid var(--line);border-radius:14px;box-shadow:0 18px 48px rgba(0,0,0,.15)}.card{padding:14px}.card .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .v{font-size:26px;font-weight:700;margin-top:3px}.panel{padding:16px;margin-bottom:14px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row.space{justify-content:space-between}textarea,input,select,button{font:inherit}textarea{width:100%;min-height:122px;resize:vertical;background:#0a1017;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px;outline:none}textarea:focus,input:focus{border-color:var(--accent)}label.check{display:inline-flex;gap:7px;align-items:center;color:var(--muted)}button{border:0;border-radius:10px;padding:9px 14px;font-weight:650;cursor:pointer;background:var(--accent);color:#06101e}button.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.5;cursor:not-allowed}.help{color:var(--muted);font-size:12px;margin:7px 0 0}.status{font-size:12px;color:var(--muted)}.status.running{color:var(--warn)}.status.err{color:var(--bad)}input[type=search],input[type=password]{background:#0a1017;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 10px;min-width:220px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:820px}th,td{text-align:left;padding:10px 11px;border-bottom:1px solid #202b39}th{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;background:#0d141d;position:sticky;top:0}tbody tr:hover{background:#131c27}.alive{color:var(--ok);font-weight:700}.dead{color:var(--bad);font-weight:650}.proto{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:#bed3ed}.muted{color:var(--muted)}.errtxt{max-width:390px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#bdc8d6}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}header{align-items:start;flex-direction:column}}@media(max-width:480px){.grid{grid-template-columns:1fr 1fr}.card:last-child{grid-column:1/-1}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><div><h1>psoc</h1><p>Bounded public HTTP / SOCKS proxy checker</p></div><div class="badge" id="version">dashboard</div></header>
+<section class="grid">
+  <div class="card"><div class="k">Alive</div><div class="v" id="alive">0</div></div>
+  <div class="card"><div class="k">HTTP</div><div class="v" id="http">0</div></div>
+  <div class="card"><div class="k">SOCKS5</div><div class="v" id="socks5">0</div></div>
+  <div class="card"><div class="k">SOCKS4</div><div class="v" id="socks4">0</div></div>
+  <div class="card"><div class="k">Avg latency</div><div class="v"><span id="latency">0</span><span style="font-size:13px;color:var(--muted)"> ms</span></div></div>
+</section>
+<section class="panel">
+  <div class="row space"><strong>Run a check</strong><span class="status" id="scanStatus">idle</span></div>
+  <textarea id="targets" placeholder="203.0.113.10:8080&#10;http://203.0.113.11:3128&#10;socks5://203.0.113.12:1080"></textarea>
+  <div class="row" style="margin-top:10px">
+    <label class="check"><input id="phttp" type="checkbox" checked> HTTP</label>
+    <label class="check"><input id="ps5" type="checkbox" checked> SOCKS5</label>
+    <label class="check"><input id="ps4" type="checkbox" checked> SOCKS4</label>
+    <input id="token" type="password" placeholder="API token (optional)">
+    <button id="scanBtn">Scan targets</button>
+  </div>
+  <p class="help">Bare host:port entries try the selected protocols. Private/local IP ranges are rejected unless the server was started with <code>--allow-private</code>.</p>
+</section>
+<section class="panel">
+  <div class="row space" style="margin-bottom:10px"><strong>Results</strong><div class="row"><input id="filter" type="search" placeholder="Filter target/protocol/error"><button class="secondary" id="refreshBtn">Refresh</button></div></div>
+  <div class="table-wrap"><table><thead><tr><th>State</th><th>Protocol</th><th>Target</th><th>Latency</th><th>Status</th><th>Checked</th><th>Error</th></tr></thead><tbody id="rows"></tbody></table></div>
+</section>
+</div>
+<script>
+const $=s=>document.querySelector(s);let all=[];let timer=null;
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function jget(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw new Error(await r.text());return r.json()}
+function render(){const q=$('#filter').value.trim().toLowerCase();const rows=all.filter(x=>!q||[x.target,x.protocol,x.error].some(v=>String(v||'').toLowerCase().includes(q)));$('#rows').innerHTML=rows.map(x=>`<tr><td class="${x.alive?'alive':'dead'}">${x.alive?'alive':'dead'}</td><td><span class="proto">${esc(x.protocol)}</span></td><td>${esc(x.target)}</td><td>${x.latency_ms||0} ms</td><td>${x.status||'-'}</td><td class="muted">${x.checked_at?new Date(x.checked_at).toLocaleString():'-'}</td><td class="errtxt" title="${esc(x.error||'')}">${esc(x.error||'')}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">No results yet.</td></tr>'}
+async function refresh(){try{const [st,rs,status,h]=await Promise.all([jget('/api/stats'),jget('/api/proxies'),jget('/api/status'),jget('/healthz')]);all=rs;$('#alive').textContent=st.alive;$('#http').textContent=st.http;$('#socks5').textContent=st.socks5;$('#socks4').textContent=st.socks4;$('#latency').textContent=st.avg_latency_ms||0;$('#version').textContent='v'+h.version;const ss=$('#scanStatus');ss.textContent=status.scanning?'scan running…':(status.last_error?'last scan failed':'idle');ss.className='status '+(status.scanning?'running':(status.last_error?'err':''));$('#scanBtn').disabled=!!status.scanning;render();if(status.scanning){clearTimeout(timer);timer=setTimeout(refresh,1500)}}catch(e){$('#scanStatus').textContent='refresh error';$('#scanStatus').className='status err'}}
+async function scan(){const targets=$('#targets').value.trim();if(!targets)return;const protocols=[];if($('#phttp').checked)protocols.push('http');if($('#ps5').checked)protocols.push('socks5');if($('#ps4').checked)protocols.push('socks4');if(!protocols.length)return;const headers={'Content-Type':'application/json'};const token=$('#token').value.trim();if(token)headers['Authorization']='Bearer '+token;$('#scanBtn').disabled=true;try{const r=await fetch('/api/scan',{method:'POST',headers,body:JSON.stringify({targets,protocols})});if(!r.ok)throw new Error((await r.text()).trim());sessionStorage.setItem('psoc-token',token);$('#scanStatus').textContent='scan accepted';$('#scanStatus').className='status running';setTimeout(refresh,500)}catch(e){$('#scanStatus').textContent=e.message;$('#scanStatus').className='status err';$('#scanBtn').disabled=false}}
+$('#filter').addEventListener('input',render);$('#refreshBtn').addEventListener('click',refresh);$('#scanBtn').addEventListener('click',scan);$('#token').value=sessionStorage.getItem('psoc-token')||'';refresh();
+</script>
+</body>
+</html>
