@@ -22,10 +22,12 @@ type App struct {
 	store    *Store
 	apiToken string
 
-	scanMu   sync.Mutex
-	scanning bool
-	started  time.Time
-	lastErr  string
+	scanMu        sync.Mutex
+	scanning      bool
+	started       time.Time
+	lastErr       string
+	scanCompleted int
+	scanTotal     int
 
 	sourceMu       sync.RWMutex
 	sourceStatuses []SourceStatus
@@ -82,10 +84,17 @@ func (a *App) handleProxies(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
+	percent := 0
+	if a.scanTotal > 0 {
+		percent = a.scanCompleted * 100 / a.scanTotal
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"scanning":   a.scanning,
 		"started":    a.started,
 		"last_error": a.lastErr,
+		"completed":  a.scanCompleted,
+		"total":      a.scanTotal,
+		"percent":    percent,
 	})
 }
 
@@ -132,7 +141,7 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !a.beginScan() {
+	if !a.beginScan(scanJobCount(targets, cfg)) {
 		http.Error(w, "scan already running", http.StatusConflict)
 		return
 	}
@@ -152,11 +161,15 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 		a.finishScan(err)
 	}()
 
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "targets": len(targets)})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"accepted": true,
+		"targets":  len(targets),
+		"checks":   scanJobCount(targets, cfg),
+	})
 }
 
 func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
-	if !a.beginScan() {
+	if !a.beginScan(0) {
 		http.Error(w, "scan already running", http.StatusConflict)
 		return
 	}
@@ -174,6 +187,7 @@ func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
 		if len(targets) == 0 {
 			err = errors.New("public sources returned no valid targets")
 		} else {
+			a.setScanTotal(scanJobCount(targets, a.cfg))
 			_, err = a.startScanWithConfig(ctx, targets, a.cfg)
 		}
 		a.finishScan(err)
@@ -186,7 +200,7 @@ func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) beginScan() bool {
+func (a *App) beginScan(total int) bool {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
 	if a.scanning {
@@ -195,7 +209,21 @@ func (a *App) beginScan() bool {
 	a.scanning = true
 	a.started = time.Now().UTC()
 	a.lastErr = ""
+	a.scanCompleted = 0
+	a.scanTotal = total
 	return true
+}
+
+func (a *App) setScanTotal(total int) {
+	a.scanMu.Lock()
+	a.scanTotal = total
+	a.scanMu.Unlock()
+}
+
+func (a *App) incrementScanProgress() {
+	a.scanMu.Lock()
+	a.scanCompleted++
+	a.scanMu.Unlock()
 }
 
 func (a *App) finishScan(err error) {
@@ -209,6 +237,7 @@ func (a *App) finishScan(err error) {
 }
 
 func (a *App) StartScan(ctx context.Context, targets []Target) ([]Result, error) {
+	a.setScanTotal(scanJobCount(targets, a.cfg))
 	return a.startScanWithConfig(ctx, targets, a.cfg)
 }
 
@@ -217,11 +246,16 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 	if err != nil {
 		return nil, err
 	}
-	results, err := scanner.Scan(ctx, targets)
-	if len(results) > 0 {
-		if persistErr := a.store.Replace(results); persistErr != nil && err == nil {
-			err = persistErr
-		}
+
+	// Start the dashboard with a clean result set, then populate it as checks
+	// finish. This avoids a long empty-results period on large public lists.
+	a.store.Reset()
+	results, err := scanner.ScanWithProgress(ctx, targets, func(r Result) {
+		a.store.Upsert(r)
+		a.incrementScanProgress()
+	})
+	if persistErr := a.store.Save(); persistErr != nil && err == nil {
+		err = persistErr
 	}
 	return results, err
 }
