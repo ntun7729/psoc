@@ -17,6 +17,8 @@ import (
 //go:embed dashboard.html results.html
 var dashboardFS embed.FS
 
+const proxyMeasurementConcurrency = 5
+
 type App struct {
 	cfg      Config
 	store    *Store
@@ -255,33 +257,43 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 		return nil, err
 	}
 
-	// Each scan starts with a clean alive-only result set. Verified proxies are
-	// visible immediately, then country and speed are filled in asynchronously.
+	// Verification runs by itself. Alive proxies are visible immediately, but
+	// bandwidth measurements wait until all proxy checks have finished so the
+	// two workloads do not compete for CPU or network scheduling.
 	a.store.Reset()
-	measureWorkers := cfg.Concurrency / 4
-	if measureWorkers < 4 {
-		measureWorkers = 4
-	}
-	if measureWorkers > 24 {
-		measureWorkers = 24
-	}
-	measureSem := make(chan struct{}, measureWorkers)
-	var measureWG sync.WaitGroup
-
 	results, err := scanner.ScanWithProgress(ctx, targets, func(r Result) {
 		if r.Alive {
-			base := ProxyResultFrom(r)
-			a.store.UpsertProxy(base)
-			measureWG.Add(1)
-			go func(pr ProxyResult) {
-				defer measureWG.Done()
-				select {
-				case measureSem <- struct{}{}:
-				case <-ctx.Done():
-					return
-				}
-				defer func() { <-measureSem }()
+			a.store.UpsertProxy(ProxyResultFrom(r))
+		}
+		a.incrementScanProgress()
+	})
 
+	if err == nil && ctx.Err() == nil {
+		a.enrichAliveProxies(ctx, scanner)
+	}
+	if persistErr := a.store.Save(); persistErr != nil && err == nil {
+		err = persistErr
+	}
+	return results, err
+}
+
+func (a *App) enrichAliveProxies(ctx context.Context, scanner *Scanner) {
+	proxies := a.store.All()
+	if len(proxies) == 0 {
+		return
+	}
+
+	workers := proxyMeasurementConcurrency
+	if len(proxies) < workers {
+		workers = len(proxies)
+	}
+	jobs := make(chan ProxyResult)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pr := range jobs {
 				country, downMbps := scanner.MeasureProxy(ctx, pr.Target, pr.Protocol)
 				if country != "" {
 					pr.Country = country
@@ -290,16 +302,20 @@ func (a *App) startScanWithConfig(ctx context.Context, targets []Target, cfg Con
 					pr.DownMbps = downMbps
 				}
 				a.store.UpsertProxy(pr)
-			}(base)
-		}
-		a.incrementScanProgress()
-	})
-
-	measureWG.Wait()
-	if persistErr := a.store.Save(); persistErr != nil && err == nil {
-		err = persistErr
+			}
+		}()
 	}
-	return results, err
+
+sendLoop:
+	for _, pr := range proxies {
+		select {
+		case jobs <- pr:
+		case <-ctx.Done():
+			break sendLoop
+		}
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
