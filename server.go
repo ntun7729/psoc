@@ -35,11 +35,12 @@ type App struct {
 	scanCompleted int
 	scanTotal     int
 
-	measuring       bool
-	measureStarted  time.Time
-	measureLastErr  string
-	measureCompleted int
-	measureTotal     int
+	measuring         bool
+	measureCancel     context.CancelFunc
+	measureStarted    time.Time
+	measureLastErr    string
+	measureCompleted  int
+	measureTotal      int
 	measureDownloadMB int
 
 	sourceMu       sync.RWMutex
@@ -67,6 +68,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /api/scan", a.withAuth(a.handleScan))
 	mux.HandleFunc("POST /api/scan/stop", a.withAuth(a.handleStopScan))
 	mux.HandleFunc("POST /api/measure", a.withAuth(a.handleMeasure))
+	mux.HandleFunc("POST /api/measure/stop", a.withAuth(a.handleStopMeasure))
 	mux.HandleFunc("POST /api/sources/refresh", a.withAuth(a.handleSourceRefresh))
 	return securityHeaders(mux)
 }
@@ -247,7 +249,7 @@ func (a *App) handleMeasure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
-	if !a.beginMeasure(len(proxies), req.DownloadMB) {
+	if !a.beginMeasure(len(proxies), req.DownloadMB, cancel) {
 		cancel()
 		http.Error(w, "proxy checking or downspeed measurement already running", http.StatusConflict)
 		return
@@ -268,6 +270,14 @@ func (a *App) handleMeasure(w http.ResponseWriter, r *http.Request) {
 		"download_mb": req.DownloadMB,
 		"concurrency": proxyMeasurementConcurrency,
 	})
+}
+
+func (a *App) handleStopMeasure(w http.ResponseWriter, r *http.Request) {
+	if !a.stopMeasure() {
+		http.Error(w, "no downspeed measurement is running", http.StatusConflict)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "stopping": true})
 }
 
 func (a *App) handleSourceRefresh(w http.ResponseWriter, r *http.Request) {
@@ -352,18 +362,29 @@ func (a *App) finishScan(err error) {
 	}
 }
 
-func (a *App) beginMeasure(total, downloadMB int) bool {
+func (a *App) beginMeasure(total, downloadMB int, cancel context.CancelFunc) bool {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
 	if a.scanning || a.measuring {
 		return false
 	}
 	a.measuring = true
+	a.measureCancel = cancel
 	a.measureStarted = time.Now().UTC()
 	a.measureLastErr = ""
 	a.measureCompleted = 0
 	a.measureTotal = total
 	a.measureDownloadMB = downloadMB
+	return true
+}
+
+func (a *App) stopMeasure() bool {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if !a.measuring || a.measureCancel == nil {
+		return false
+	}
+	a.measureCancel()
 	return true
 }
 
@@ -377,6 +398,7 @@ func (a *App) finishMeasure(err error) {
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
 	a.measuring = false
+	a.measureCancel = nil
 	if err != nil && !errors.Is(err, context.Canceled) {
 		a.measureLastErr = err.Error()
 		log.Printf("measure: %v", err)
